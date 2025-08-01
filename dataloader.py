@@ -55,7 +55,7 @@ class MSVDDataset(Dataset):
             Lowercase(),
             RemovePunctuation(),
             SplitWithWhiteSpace(),
-            Truncate(self.max_frame),
+            Truncate(self.max_seq_len),
         ])
         self.tokenizer = tokenizer
 
