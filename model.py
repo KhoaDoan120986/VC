@@ -136,6 +136,11 @@ class Decoder(nn.Module):
         for p in self.model.language_model.parameters():
             p.requires_grad = True
 
+        hidden_size = self.model.qformer.config.hidden_size
+        self.model.query_tokens = nn.Parameter(
+            torch.zeros(1, self.task_config.max_seq_len, hidden_size)
+        )
+        nn.init.normal_(self.model.query_tokens, mean=0.0, std=0.02)
         self.model.language_model.decoder.block = self.model.language_model.decoder.block[:4]
         self.vocab_size = self.model.language_model.config.vocab_size
 
@@ -150,18 +155,35 @@ class Decoder(nn.Module):
         )
         self.model.language_model = get_peft_model(self.model.language_model, lora_config)
 
-    def forward(self, encoder_hidden_states, caption=None, caption_mask=None):
-        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden_states)
-        if caption is not None:
-            outputs = self.model.language_model(
+    def get_qformer(self, encoder_hidden_states, mask):
+        # ===> 1. Query tokens <===
+        query_tokens = self.model.query_tokens.expand(encoder_hidden_states.size(0), -1, -1)
+        # ===> 2. Chạy Q-Former với custom encoder output <===
+        qformer_outputs = self.model.qformer(
+            query_embeds=query_tokens,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=mask,
+            return_dict=True,
+        )
+        qformer_hidden = qformer_outputs.last_hidden_state   # [batch, num_queries, hidden_dim]
+        # ===> 3. Projection sang LM space <===
+        projected_features = self.model.language_projection(qformer_hidden)
+        return projected_features
+
+    def forward(self, encoder_hidden_states, encoder_mask, caption, caption_mask=None):
+        projected_features = self.get_qformer(encoder_hidden_states, encoder_mask)    
+        encoder_outputs = BaseModelOutput(last_hidden_state=projected_features)
+
+        outputs = self.model.language_model(
                 encoder_outputs=encoder_outputs,
                 decoder_input_ids=caption,           
                 attention_mask=caption_mask,
                 return_dict=True,
-            )
-            return outputs
-    def generate(self, encoder_hidden_states):
-        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden_states)
+        )
+        return outputs
+    def generate(self, encoder_hidden_states, encoder_mask):
+        projected_features = self.get_qformer(encoder_hidden_states, encoder_mask)    
+        encoder_outputs = BaseModelOutput(last_hidden_state=projected_features)
         generated = self.model.language_model.generate(
             encoder_outputs=encoder_outputs,
             max_length=self.task_config.max_seq_len + 1,
@@ -180,9 +202,9 @@ class VCModel(nn.Module):
         self.decoder = Decoder(tokenizer, task_config, decoder_model_class)
     def forward(self, video, video_mask, motion, motion_mask, kg, kg_mask, caption=None, caption_mask=None):
         encoder_hidden_states = self.encoder(video, video_mask, motion, motion_mask, kg, kg_mask)
-        decoder_output = self.decoder(encoder_hidden_states, caption, caption_mask)
+        decoder_output = self.decoder(encoder_hidden_states, video_mask, caption, caption_mask)
         return decoder_output
     def generate(self, video, video_mask, motion, motion_mask, kg, kg_mask):
         encoder_hidden_states = self.encoder(video, video_mask, motion, motion_mask, kg, kg_mask)
-        generated = self.decoder.generate(encoder_hidden_states)
+        generated = self.decoder.generate(encoder_hidden_states, video_mask)
         return generated
