@@ -1,9 +1,12 @@
 from modules.module_visual import NormalizeVideo, VisualModel, VisualConfig
 from modules.until_module import LayerNorm
-import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutput
-import torch 
+from torch_geometric.nn import TransformerConv
 from peft import LoraConfig, get_peft_model
+import torch.nn.functional as F
+import torch.nn as nn
+import torch 
+
 
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff=2048, dropout=0.1):
@@ -29,6 +32,41 @@ class EncoderLayer(nn.Module):
         x = self.norm2(x + self.dropout2(ff_output))
         return x
 
+class TransC(nn.Module):
+    def __init__(self, node_feat_dim, d_model, edge_dim, heads=4, project_edge_dim=None, more_skip=True, last_average=False, beta=True):
+        super().__init__()
+        self.lp = nn.Linear(node_feat_dim, d_model)
+        self.more_skip = more_skip
+        self.project_edge_dim = project_edge_dim
+        if self.project_edge_dim is not None:
+            self.lp_edge_attr = nn.Linear(edge_dim, project_edge_dim)
+            edge_dim = project_edge_dim
+        
+        self.conv1 = TransformerConv(d_model, int(d_model/heads), heads, edge_dim=edge_dim, aggr='mean', beta=beta)
+        
+        self.conv2 = TransformerConv(d_model, int(d_model/heads), heads, edge_dim=edge_dim, aggr='mean', beta=beta)
+        
+        if last_average:
+            self.conv3 = TransformerConv(d_model, d_model, heads, concat=False, edge_dim=edge_dim, aggr='mean', beta=beta)
+        else:
+            self.conv3 = TransformerConv(d_model, int(d_model/heads), heads, edge_dim=edge_dim, aggr='mean', beta=beta)
+
+    def forward(self, data):
+        x = self.lp(data.x)
+        if self.project_edge_dim is not None:
+            e = F.relu(self.lp_edge_attr(data.edge_attr))
+        else:
+            e = data.edge_attr
+        if self.more_skip:
+            x = F.relu(x + self.conv1(x, data.edge_index, e))
+            x = F.relu(x + self.conv2(x, data.edge_index, e))
+            x = F.relu(x + self.conv3(x, data.edge_index, e))
+        else:
+            x = F.relu(self.conv1(x, data.edge_index, e))
+            x = F.relu(self.conv2(x, data.edge_index, e))
+            x = F.relu(self.conv3(x, data.edge_index, e))
+        return x
+    
     
 class Encoder(nn.Module):
     def __init__(self, task_config, type_vocab_size=2):
@@ -42,17 +80,16 @@ class Encoder(nn.Module):
         assert self.task_config.max_frames <= self.visual_config.max_position_embeddings
         self.visual_config.num_hidden_layers = self.task_config.visual_num_hidden_layers
 
-        # ====> Visual <====
-        self.visual_lp1 = nn.Linear(self.task_config.visual_dim, self.visual_config.vocab_size)
+        # ====> Graph <====
+        self.transc = TransC(node_feat_dim=task_config.node_feat_dim, 
+                            d_model=task_config.d_graph, edge_dim=task_config.edge_dim, 
+                            project_edge_dim=task_config.project_edge_dim,
+                            more_skip=task_config.no_skip==False, last_average=task_config.last_average,
+                            beta=task_config.no_beta_transformer==False)
+        
         self.visual = VisualModel(self.visual_config)
         self.visual_normalize_video = NormalizeVideo(self.visual_config.vocab_size)
         self.visual_lp2 = nn.Linear(self.visual_config.hidden_size, self.task_config.d_model)
-
-        # ====> Motion <====
-        self.motion_lp1 = nn.Linear(self.task_config.motion_dim, self.visual_config.vocab_size)
-        self.motion = VisualModel(self.visual_config)
-        self.motion_normalize_video = NormalizeVideo(self.visual_config.vocab_size)
-        self.motion_lp2 = nn.Linear(self.visual_config.hidden_size, self.task_config.d_model)
 
         # ====> Semantic <====
         self.semantic_embeddings = nn.Sequential(
@@ -82,30 +119,20 @@ class Encoder(nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
-    def forward(self, video, video_mask, motion, motion_mask, kg, kg_mask, shaped=False):
-        assert video.shape[2] == self.task_config.visual_dim
-        assert motion.shape[2] == self.task_config.motion_dim
-        assert kg.shape[2] == self.task_config.semantic_dim
+    def forward(self, geo_graph, video_mask, kg, kg_mask, shaped=False):
+        # ====> Graph <====
+        batch = video_mask.shape[0]
+        n_nodes = geo_graph.x.shape[0] // batch
+        fo_convolved = self.transc(geo_graph)
+        fo_convolved = fo_convolved.unflatten(0, (batch, n_nodes))
 
-        # ====> Visual <====
-        video = self.visual_lp1(video)
         if shaped is False:
             video_mask = video_mask.view(-1, video_mask.shape[-1])
-            video = self.visual_normalize_video(video)
+            video = self.visual_normalize_video(fo_convolved)
 
         visual_layers, _ = self.visual(video, video_mask, output_all_encoded_layers=True)
         visual_output = visual_layers[-1]
         visual_output = self.visual_lp2(visual_output)
-
-        # ====> Motion <====
-        motion = self.motion_lp1(motion)
-        if shaped is False:
-            motion_mask = motion_mask.view(-1, motion_mask.shape[-1])
-            motion = self.motion_normalize_video(motion)
-
-        motion_layers, _ = self.motion(motion, motion_mask, output_all_encoded_layers=True)
-        motion_output = motion_layers[-1]
-        motion_output = self.motion_lp2(motion_output)
 
         # ====> Semantic <====
         kg_output = self.semantic_embeddings(kg)
@@ -113,7 +140,7 @@ class Encoder(nn.Module):
             kg_output = self.semantic[i](kg_output, kg_mask)
         kg_output = self.semantic_lp(kg_output)
 
-        return visual_output + motion_output + kg_output
+        return visual_output  + kg_output
         
 class Decoder(nn.Module):
     def __init__(self, tokenizer, task_config, model_class):
@@ -135,7 +162,7 @@ class Decoder(nn.Module):
         for p in self.model.language_model.parameters():
             p.requires_grad = True
 
-        # self.model.language_model.decoder.block = self.model.language_model.decoder.block[:4]
+        self.model.language_model.decoder.block = self.model.language_model.decoder.block[:3]
         self.vocab_size = self.model.language_model.config.vocab_size
         
         # ===> ÁP DỤNG LoRA <===
@@ -176,11 +203,11 @@ class VCModel(nn.Module):
         self.task_config = task_config
         self.encoder = Encoder(task_config)
         self.decoder = Decoder(tokenizer, task_config, decoder_model_class)
-    def forward(self, video, video_mask, motion, motion_mask, kg, kg_mask, caption=None, caption_mask=None):
-        encoder_hidden_states = self.encoder(video, video_mask, motion, motion_mask, kg, kg_mask)
+    def forward(self, geo_graph, video_mask, kg, kg_mask, caption=None, caption_mask=None):
+        encoder_hidden_states = self.encoder(geo_graph, video_mask, kg, kg_mask)
         decoder_output = self.decoder(encoder_hidden_states, caption, caption_mask)
         return decoder_output
-    def generate(self, video, video_mask, motion, motion_mask, kg, kg_mask):
-        encoder_hidden_states = self.encoder(video, video_mask, motion, motion_mask, kg, kg_mask)
+    def generate(self, geo_graph, video_mask, kg, kg_mask):
+        encoder_hidden_states = self.encoder(geo_graph, video_mask, kg, kg_mask)
         generated = self.decoder.generate(encoder_hidden_states)
         return generated

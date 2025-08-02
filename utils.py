@@ -1,7 +1,9 @@
 from tqdm import tqdm
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.data import Data
 
 from pycocoevalcap.bleu.bleu import Bleu
 from pycocoevalcap.rouge.rouge import Rouge
@@ -53,21 +55,20 @@ class LabelSmoothing(nn.Module):
 
 
 def parse_batch(batch, device):
-    vid, visual_feature, visual_mask, motion_feature, motion_mask,\
+    vid, node_feature, edge_index, edge_feature, visual_mask,\
             semantic_feature, semantic_mask, input_ids, attention_mask = batch
 
-    visual_feature = visual_feature.to(device)
+    node_feature = node_feature.to(device)
+    edge_index = edge_index.to(device)
+    edge_feature = edge_feature.to(device)
     visual_mask = visual_mask.to(device)
-
-    motion_feature = motion_feature.to(device)
-    motion_mask = motion_mask.to(device)
 
     semantic_feature = semantic_feature.to(device)
     semantic_mask = semantic_mask.to(device)
 
     input_ids = input_ids.to(device)
     attention_mask = attention_mask.to(device)
-    return vid, visual_feature, visual_mask, motion_feature, motion_mask,\
+    return vid, node_feature, edge_index, edge_feature, visual_mask,\
             semantic_feature, semantic_mask, input_ids, attention_mask
 
 def train(epoch, data_loader, model, tokenizer, gradient_accumulation_steps, optimizer, lr_scheduler, gradient_clip, device):
@@ -77,15 +78,31 @@ def train(epoch, data_loader, model, tokenizer, gradient_accumulation_steps, opt
     criterion = LabelSmoothing(vocab_size, tokenizer.pad_token_id, 0.1)
     t = tqdm(data_loader)
     for step, batch in enumerate(t):
-        vid, visual_feature, visual_mask, motion_feature, motion_mask,\
-            semantic_feature, semantic_mask, captions, attention_mask = batch = parse_batch(batch, device)
+        vid, geo_x, geo_edge_index, geo_edge_attr, visual_mask,\
+            semantic_feature, semantic_mask, captions, attention_mask = parse_batch(batch, device)
 
         input_ids = captions[:, :-1]
         labels = captions[:, 1:]
         input_mask = attention_mask[:, :-1]
         
-        output = model(visual_feature, visual_mask,
-                       motion_feature, motion_mask, 
+        batch_sz = geo_x.shape[0]
+        x_batch = geo_x.reshape(geo_x.shape[0] * geo_x.shape[1], geo_x.shape[2])
+        offset = []
+        for i in range(batch_sz):
+            n_edges = geo_edge_index[0].shape[1]
+            offset_val = int(np.sqrt(n_edges)) * i
+            offset.append(torch.full(geo_edge_index[0].shape, offset_val))
+        offset = torch.stack(offset).cuda()
+        geo_graph_batch_offset = geo_edge_index + offset
+
+        new_dim = geo_graph_batch_offset.shape[0] * geo_graph_batch_offset.shape[2]
+        edge_index_batch = geo_graph_batch_offset.permute(1, 0, 2).reshape(2, new_dim)
+        edge_attr_batch = geo_edge_attr.reshape(geo_edge_attr.shape[0] * geo_edge_attr.shape[1],
+                                                geo_edge_attr.shape[2]).float()
+
+        data_geo_graph_batch = Data(x=x_batch, edge_index=edge_index_batch, edge_attr=edge_attr_batch)
+        
+        output = model(data_geo_graph_batch, visual_mask,
                        semantic_feature, semantic_mask,
                        caption=input_ids, caption_mask=input_mask)
 
@@ -117,15 +134,31 @@ def test(epoch, data_loader, model, tokenizer, device):
     t = tqdm(data_loader, desc='Test: ')
     with torch.no_grad():
         for step, batch in enumerate(t):
-            vid, visual_feature, visual_mask, motion_feature, motion_mask,\
-            semantic_feature, semantic_mask, captions, attention_mask = batch = parse_batch(batch, device)
+            vid, geo_x, geo_edge_index, geo_edge_attr, visual_mask,\
+            semantic_feature, semantic_mask, captions, attention_mask = parse_batch(batch, device)
 
             input_ids = captions[:, :-1]
             labels = captions[:, 1:]
             input_mask = attention_mask[:, :-1]
             
-            output = model(visual_feature, visual_mask,
-                        motion_feature, motion_mask, 
+            batch_sz = geo_x.shape[0]
+            x_batch = geo_x.reshape(geo_x.shape[0] * geo_x.shape[1], geo_x.shape[2])
+            offset = []
+            for i in range(batch_sz):
+                n_edges = geo_edge_index[0].shape[1]
+                offset_val = int(np.sqrt(n_edges)) * i
+                offset.append(torch.full(geo_edge_index[0].shape, offset_val))
+            offset = torch.stack(offset).cuda()
+            geo_graph_batch_offset = geo_edge_index + offset
+
+            new_dim = geo_graph_batch_offset.shape[0] * geo_graph_batch_offset.shape[2]
+            edge_index_batch = geo_graph_batch_offset.permute(1, 0, 2).reshape(2, new_dim)
+            edge_attr_batch = geo_edge_attr.reshape(geo_edge_attr.shape[0] * geo_edge_attr.shape[1],
+                                                    geo_edge_attr.shape[2]).float()
+
+            data_geo_graph_batch = Data(x=x_batch, edge_index=edge_index_batch, edge_attr=edge_attr_batch)
+        
+            output = model(data_geo_graph_batch, visual_mask,
                         semantic_feature, semantic_mask,
                         caption=input_ids, caption_mask=input_mask)
     
@@ -156,19 +189,19 @@ def get_predicted_captions(model, tokenizer, data_loader, device):
     videos = set()
     with torch.no_grad():
         for batch in tqdm(data_loader, desc='get_predicted_captions: '):
-            video_ids, visual_feature, visual_mask, motion_feature, motion_mask,\
+            video_ids, geo_x, geo_edge_index, geo_edge_attr, visual_mask,\
             semantic_feature, semantic_mask = batch[:7]
             for i, vid in enumerate(video_ids):
                 if vid in videos:
                     continue
                 videos.add(vid)
-                v_feat = visual_feature[i].unsqueeze(0).to(device)
+                data_geo_graph = Data(x=geo_x[i].to(device), 
+                                    edge_index=geo_edge_index[i].to(device),
+                                    edge_attr=geo_edge_attr[i].to(device))
                 v_mask = visual_mask[i].unsqueeze(0).to(device)
-                m_feat = motion_feature[i].unsqueeze(0).to(device)
-                m_mask = motion_mask[i].unsqueeze(0).to(device)
                 k_feat = semantic_feature[i].unsqueeze(0).to(device)
                 k_mask = semantic_mask[i].unsqueeze(0).to(device)
-                tokens = model.generate(v_feat, v_mask, m_feat, m_mask, k_feat, k_mask)
+                tokens = model.generate(data_geo_graph, v_mask, k_feat, k_mask)
                 vid2pred[vid] = tokenizer.decode(tokens[0], skip_special_tokens=True)
                 
     return vid2pred

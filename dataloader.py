@@ -8,6 +8,8 @@ import string
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+import numpy as np
+import itertools
 import gc
 
 class TrimExceptAscii:
@@ -69,12 +71,14 @@ class MSVDDataset(Dataset):
 
     def __getitem__(self, idx):
         vid, caption = self.data[idx]
-        visual_feature = self.features[vid]['visual']     
-        visual_mask = self.features[vid]['visual_mask'] 
-        motion_feature = self.features[vid]['motion']
-        motion_mask = self.features[vid]['motion_mask'] 
         semantic_feature = self.features[vid]['semantic']
         semantic_mask = self.features[vid]['semantic_mask']
+
+        visual_mask = self.features[vid]['visual_mask'] 
+        node_feature = self.features[vid]['visual']     
+        edge_index = torch.tensor(list(map(list, itertools.product(np.arange(edge_feature.shape[0]), repeat=2))), dtype=torch.long)
+        edge_feature = self.features[vid]['edge'] 
+
             
         caption = ' '.join(caption)
         if self.tokenizer is None:
@@ -94,35 +98,44 @@ class MSVDDataset(Dataset):
             attention_mask = tokenized.attention_mask.squeeze(0)
         input_ids = tokenized.input_ids.squeeze(0)  
         attention_mask = tokenized.attention_mask.squeeze(0)
-        return vid, visual_feature, visual_mask, motion_feature, motion_mask,\
+        return vid, node_feature, edge_index, edge_feature, visual_mask,\
             semantic_feature, semantic_mask, input_ids, attention_mask
     
     def load_feat(self, video_ids):
-        feature_list = ['visual', 'motion', 'semantic']
+        feature_list = ['visual', 'edge', 'semantic']
         for feature_name in feature_list:
             file_path = f'{self.data_path}/data/MSVD/features/MSVD_{feature_name}_clip.hdf5'
-            with h5py.File(file_path, "r") as fs:
-                for key in video_ids:
-                    if key not in self.features.keys():
-                        self.features[key] = {}
+            if feature_name == "edge":
+                with h5py.File(file_path, "r") as fs:
+                    for key in video_ids:
+                        if key not in self.features.keys():
+                            self.features[key] = {}
 
                     feature = torch.from_numpy(fs[key][()])
-                    num_frames, feat_dim = feature.shape
-                    pad_len = self.max_frame - num_frames
-                    
-                    if pad_len < 0:
-                        feature = feature[:self.max_frame]
-                        mask = torch.zeros(self.max_frame, dtype=torch.bool)
-                    else:
-                        pad_feat = torch.zeros((pad_len, feat_dim), dtype=feature.dtype)
-                        feature = torch.cat([feature, pad_feat], dim=0)
-                        mask = torch.cat([
-                            torch.zeros(num_frames, dtype=torch.bool),
-                            torch.ones(pad_len, dtype=torch.bool)
-                        ])
-                        
                     self.features[key][feature_name] = feature
-                    self.features[key][f'{feature_name}_mask'] = mask
+            else: 
+                with h5py.File(file_path, "r") as fs:
+                    for key in video_ids:
+                        if key not in self.features.keys():
+                            self.features[key] = {}
+
+                        feature = torch.from_numpy(fs[key][()])
+                        num_frames, feat_dim = feature.shape
+                        pad_len = self.max_frame - num_frames
+                        
+                        if pad_len < 0:
+                            feature = feature[:self.max_frame]
+                            mask = torch.zeros(self.max_frame, dtype=torch.bool)
+                        else:
+                            pad_feat = torch.zeros((pad_len, feat_dim), dtype=feature.dtype)
+                            feature = torch.cat([feature, pad_feat], dim=0)
+                            mask = torch.cat([
+                                torch.zeros(num_frames, dtype=torch.bool),
+                                torch.ones(pad_len, dtype=torch.bool)
+                            ])
+                            
+                        self.features[key][feature_name] = feature
+                        self.features[key][f'{feature_name}_mask'] = mask
 
     def load_data(self):
         caption_fpath = f'{self.data_path}/data/MSVD/metadata/{self.phase}.csv'
@@ -171,18 +184,19 @@ class MSRVTTDataset(Dataset):
 
     def __getitem__(self, idx):
         vid, caption = self.data[idx]
-        print(self.features[vid].keys())
-        visual_feature = self.features[vid]['visual']     
-        visual_mask = self.features[vid]['visual_mask'] 
-        motion_feature = self.features[vid]['motion']
-        motion_mask = self.features[vid]['motion_mask'] 
         semantic_feature = self.features[vid]['semantic']
         semantic_mask = self.features[vid]['semantic_mask']
+
+        visual_mask = self.features[vid]['visual_mask'] 
+        node_feature = self.features[vid]['visual']     
+        edge_index = torch.tensor(list(map(list, itertools.product(np.arange(edge_feature.shape[0]), repeat=2))), dtype=torch.long)
+        edge_feature = self.features[vid]['edge'] 
+
             
         caption = ' '.join(caption)
         if self.tokenizer is None:
-            input_ids = None
-            attention_mask = None
+            input_ids = []
+            attention_mask = []
         else: 
             tokenized = self.tokenizer(
                 caption,
@@ -195,35 +209,46 @@ class MSRVTTDataset(Dataset):
             )
             input_ids = tokenized.input_ids.squeeze(0)  
             attention_mask = tokenized.attention_mask.squeeze(0)
-        return vid, visual_feature, visual_mask, motion_feature, motion_mask,\
+        input_ids = tokenized.input_ids.squeeze(0)  
+        attention_mask = tokenized.attention_mask.squeeze(0)
+        return vid, node_feature, edge_index, edge_feature, visual_mask,\
             semantic_feature, semantic_mask, input_ids, attention_mask
 
     def load_feat(self, video_ids):
-        feature_list = ['visual', 'motion', 'semantic']
+        feature_list = ['visual', 'edge', 'semantic']
         for feature_name in feature_list:
             file_path = f'{self.data_path}/data/MSR-VTT/features/MSR-VTT_{feature_name}_clip.hdf5'
-            with h5py.File(file_path, "r") as fs:
-                for key in video_ids:
-                    if key not in self.features.keys():
-                        self.features[key] = {}
+            if feature_name == "edge":
+                with h5py.File(file_path, "r") as fs:
+                    for key in video_ids:
+                        if key not in self.features.keys():
+                            self.features[key] = {}
 
                     feature = torch.from_numpy(fs[key][()])
-                    num_frames, feat_dim = feature.shape
-                    pad_len = self.max_frame - num_frames
-                    
-                    if pad_len < 0:
-                        feature = feature[:self.max_frame]
-                        mask = torch.zeros(self.max_frame, dtype=torch.bool)
-                    else:
-                        pad_feat = torch.zeros((pad_len, feat_dim), dtype=feature.dtype)
-                        feature = torch.cat([feature, pad_feat], dim=0)
-                        mask = torch.cat([
-                            torch.zeros(num_frames, dtype=torch.bool),
-                            torch.ones(pad_len, dtype=torch.bool)
-                        ])
-                        
                     self.features[key][feature_name] = feature
-                    self.features[key][f'{feature_name}_mask'] = mask
+            else: 
+                with h5py.File(file_path, "r") as fs:
+                    for key in video_ids:
+                        if key not in self.features.keys():
+                            self.features[key] = {}
+
+                        feature = torch.from_numpy(fs[key][()])
+                        num_frames, feat_dim = feature.shape
+                        pad_len = self.max_frame - num_frames
+                        
+                        if pad_len < 0:
+                            feature = feature[:self.max_frame]
+                            mask = torch.zeros(self.max_frame, dtype=torch.bool)
+                        else:
+                            pad_feat = torch.zeros((pad_len, feat_dim), dtype=feature.dtype)
+                            feature = torch.cat([feature, pad_feat], dim=0)
+                            mask = torch.cat([
+                                torch.zeros(num_frames, dtype=torch.bool),
+                                torch.ones(pad_len, dtype=torch.bool)
+                            ])
+                            
+                        self.features[key][feature_name] = feature
+                        self.features[key][f'{feature_name}_mask'] = mask
 
     def load_data(self):
         caption_fpath = f'{self.data_path}/data/MSR-VTT/metadata/{self.phase}.json'
