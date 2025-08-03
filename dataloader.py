@@ -71,13 +71,13 @@ class MSVDDataset(Dataset):
 
     def __getitem__(self, idx):
         vid, caption = self.data[idx]
-        semantic_feature = self.features[vid]['semantic']
         semantic_mask = self.features[vid]['semantic_mask']
+        semantic_feature = self.features[vid]['semantic']
 
         visual_mask = self.features[vid]['visual_mask'] 
         node_feature = self.features[vid]['visual']     
-        edge_index = torch.tensor(list(map(list, itertools.product(np.arange(edge_feature.shape[0]), repeat=2))), dtype=torch.long)
-        edge_feature = self.features[vid]['edge'] 
+        edge_feature = self.features[vid]['edge_attr']
+        edge_index = self.features[vid]['edge_index']
 
             
         caption = ' '.join(caption)
@@ -105,21 +105,17 @@ class MSVDDataset(Dataset):
         feature_list = ['visual', 'edge', 'semantic']
         for feature_name in feature_list:
             file_path = f'{self.data_path}/data/MSVD/features/MSVD_{feature_name}_clip.hdf5'
-            if feature_name == "edge":
-                with h5py.File(file_path, "r") as fs:
-                    for key in video_ids:
-                        if key not in self.features.keys():
-                            self.features[key] = {}
+            with h5py.File(file_path, "r") as fs:
+                for key in video_ids:
+                    if key not in self.features.keys():
+                        self.features[key] = {}
 
                     feature = torch.from_numpy(fs[key][()])
-                    self.features[key][feature_name] = feature
-            else: 
-                with h5py.File(file_path, "r") as fs:
-                    for key in video_ids:
-                        if key not in self.features.keys():
-                            self.features[key] = {}
-
-                        feature = torch.from_numpy(fs[key][()])
+                    if feature_name == 'edge':
+                        row, col, dim = feature.shape
+                        self.features[key]['edge_index'] = torch.tensor(list(map(list, itertools.product(np.arange(row), repeat=2))), dtype=torch.long)
+                        self.features[key]['edge_attr'] = feature.reshape(row * col,dim)
+                    else: 
                         num_frames, feat_dim = feature.shape
                         pad_len = self.max_frame - num_frames
                         
@@ -184,14 +180,13 @@ class MSRVTTDataset(Dataset):
 
     def __getitem__(self, idx):
         vid, caption = self.data[idx]
-        semantic_feature = self.features[vid]['semantic']
         semantic_mask = self.features[vid]['semantic_mask']
+        semantic_feature = self.features[vid]['semantic']
 
         visual_mask = self.features[vid]['visual_mask'] 
         node_feature = self.features[vid]['visual']     
-        edge_index = torch.tensor(list(map(list, itertools.product(np.arange(edge_feature.shape[0]), repeat=2))), dtype=torch.long)
-        edge_feature = self.features[vid]['edge'] 
-
+        edge_feature = self.features[vid]['edge_attr']
+        edge_index = self.features[vid]['edge_index']
             
         caption = ' '.join(caption)
         if self.tokenizer is None:
@@ -218,21 +213,17 @@ class MSRVTTDataset(Dataset):
         feature_list = ['visual', 'edge', 'semantic']
         for feature_name in feature_list:
             file_path = f'{self.data_path}/data/MSR-VTT/features/MSR-VTT_{feature_name}_clip.hdf5'
-            if feature_name == "edge":
-                with h5py.File(file_path, "r") as fs:
-                    for key in video_ids:
-                        if key not in self.features.keys():
-                            self.features[key] = {}
+            with h5py.File(file_path, "r") as fs:
+                for key in video_ids:
+                    if key not in self.features.keys():
+                        self.features[key] = {}
 
                     feature = torch.from_numpy(fs[key][()])
-                    self.features[key][feature_name] = feature
-            else: 
-                with h5py.File(file_path, "r") as fs:
-                    for key in video_ids:
-                        if key not in self.features.keys():
-                            self.features[key] = {}
-
-                        feature = torch.from_numpy(fs[key][()])
+                    if feature_name == 'edge':
+                        row, col, dim = feature.shape
+                        self.features[key]['edge_index'] = torch.tensor(list(map(list, itertools.product(np.arange(row), repeat=2))), dtype=torch.long)
+                        self.features[key]['edge_attr'] = feature.reshape(row * col,dim)
+                    else: 
                         num_frames, feat_dim = feature.shape
                         pad_len = self.max_frame - num_frames
                         
