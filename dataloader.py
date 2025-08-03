@@ -113,7 +113,8 @@ class MSVDDataset(Dataset):
                     feature = torch.from_numpy(fs[key][()])
                     if feature_name == 'edge':
                         row, col, dim = feature.shape
-                        self.features[key]['edge_index'] = torch.tensor(list(map(list, itertools.product(np.arange(row), repeat=2))), dtype=torch.long)
+                        edge_index = torch.tensor(list(map(list, itertools.product(np.arange(row), repeat=2))), dtype=torch.long)
+                        self.features[key]['edge_index'] = edge_index.T
                         self.features[key]['edge_attr'] = feature.reshape(row * col,dim)
                     else: 
                         num_frames, feat_dim = feature.shape
@@ -221,7 +222,8 @@ class MSRVTTDataset(Dataset):
                     feature = torch.from_numpy(fs[key][()])
                     if feature_name == 'edge':
                         row, col, dim = feature.shape
-                        self.features[key]['edge_index'] = torch.tensor(list(map(list, itertools.product(np.arange(row), repeat=2))), dtype=torch.long)
+                        edge_index = torch.tensor(list(map(list, itertools.product(np.arange(row), repeat=2))), dtype=torch.long)
+                        self.features[key]['edge_index'] = edge_index.T
                         self.features[key]['edge_attr'] = feature.reshape(row * col,dim)
                     else: 
                         num_frames, feat_dim = feature.shape
