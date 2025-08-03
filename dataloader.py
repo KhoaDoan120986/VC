@@ -110,13 +110,12 @@ class MSVDDataset(Dataset):
                     if key not in self.features.keys():
                         self.features[key] = {}
 
-                    feature = torch.from_numpy(fs[key][()])
                     if feature_name == 'edge':
-                        row, col, dim = feature.shape
-                        edge_index = torch.tensor(list(map(list, itertools.product(np.arange(row), repeat=2))), dtype=torch.long)
-                        self.features[key]['edge_index'] = edge_index.T
-                        self.features[key]['edge_attr'] = feature.reshape(row * col,dim)
+                        feature = fs[key]
+                        self.features[key]['edge_index'] = feature['edge_index'][()]
+                        self.features[key]['edge_attr'] = feature['edge_attr'][()]
                     else: 
+                        feature = torch.from_numpy(fs[key][()])
                         num_frames, feat_dim = feature.shape
                         pad_len = self.max_frame - num_frames
                         
