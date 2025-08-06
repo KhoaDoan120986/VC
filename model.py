@@ -171,14 +171,13 @@ class Decoder(nn.Module):
         )
         self.model.language_model = get_peft_model(self.model.language_model, lora_config)
         
-    def forward(self, encoder_hidden_states, video_mask, caption, caption_mask, labels):
+    def forward(self, encoder_hidden_states, video_mask, caption, caption_mask):
         encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden_states)
         outputs = self.model.language_model(
             encoder_outputs=encoder_outputs,
             attention_mask=video_mask,            # mask cho encoder
             decoder_input_ids=caption,            # input captions (shifted)
             decoder_attention_mask=caption_mask,  # mask cho decoder
-            labels=labels,                        # ground truth captions (shifted by 1)
             return_dict=True,
         )
         return outputs
@@ -208,12 +207,12 @@ class VCModel(nn.Module):
         self.visual_lp = nn.Linear(self.task_config.hidden_size, self.decoder.model.language_model.config.d_model)
         self.semantic_lp = nn.Linear(self.task_config.hidden_size, self.decoder.model.language_model.config.d_model)
 
-    def forward(self, geo_graph, video_mask, kg, kg_mask, caption, caption_mask, labels):
+    def forward(self, geo_graph, video_mask, kg, kg_mask, caption, caption_mask):
         visual_output, kg_output = self.encoder(geo_graph, video_mask, kg, kg_mask)
         visual_output = self.visual_lp(visual_output)
         kg_output = self.semantic_lp(kg_output)
         encoder_hidden_states = visual_output + kg_output
-        decoder_output = self.decoder(encoder_hidden_states, video_mask, caption, caption_mask, labels)
+        decoder_output = self.decoder(encoder_hidden_states, video_mask, caption, caption_mask)
         return decoder_output
     
     def generate(self, geo_graph, video_mask, kg, kg_mask):

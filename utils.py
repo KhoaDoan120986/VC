@@ -29,7 +29,28 @@ class LossChecker:
             mean_losses[i] = sum(_loss) / len(_loss)
         return mean_losses
 
-
+class LabelSmoothing(nn.Module):
+    """Implement label smoothing."""
+    
+    def __init__(self, size, padding_idx, smoothing=0.0):
+        super(LabelSmoothing, self).__init__()
+        self.criterion = nn.KLDivLoss(reduction='batchmean')
+        self.padding_idx = padding_idx
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.size = size
+        self.true_dist = None
+    
+    def forward(self, x, target):
+        assert x.size(1) == self.size
+        true_dist = torch.full_like(x, self.smoothing / (self.size - 2))
+        true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+        true_dist[:, self.padding_idx] = 0
+        mask = (target == self.padding_idx)
+        true_dist[mask] = 0
+        self.true_dist = true_dist.detach()
+        return self.criterion(x, true_dist)
+    
 def parse_batch(batch, device):
     vid, node_feature, edge_index, edge_feature, visual_mask,\
             semantic_feature, semantic_mask, input_ids, attention_mask = batch
@@ -51,6 +72,7 @@ def train(epoch, data_loader, model, tokenizer, gradient_accumulation_steps, opt
     model.train()
     loss_checker = LossChecker(2)
     vocab_size = model.decoder.vocab_size
+    criterion = LabelSmoothing(vocab_size, tokenizer.pad_token_id, 0.1)
     t = tqdm(data_loader)
     for step, batch in enumerate(t):
         vid, geo_x, geo_edge_index, geo_edge_attr, visual_mask,\
@@ -66,8 +88,8 @@ def train(epoch, data_loader, model, tokenizer, gradient_accumulation_steps, opt
         for i in range(batch_sz):
             n_edges = geo_edge_index[0].shape[1]
             offset_val = int(np.sqrt(n_edges)) * i
-            offset.append(torch.full(geo_edge_index[0].shape, offset_val))
-        offset = torch.stack(offset).cuda()
+            offset.append(torch.full(geo_edge_index[0].shape, offset_val, device=device))
+        offset = torch.stack(offset)
         geo_graph_batch_offset = geo_edge_index + offset
 
         new_dim = geo_graph_batch_offset.shape[0] * geo_graph_batch_offset.shape[2]
@@ -79,9 +101,11 @@ def train(epoch, data_loader, model, tokenizer, gradient_accumulation_steps, opt
         
         output = model(data_geo_graph_batch, visual_mask,
                        semantic_feature, semantic_mask,
-                       caption=input_ids, caption_mask=input_mask, labels=labels)
+                       caption=input_ids, caption_mask=input_mask)
 
-        loss = output.loss
+        log_probs = F.log_softmax(output.logits, dim=-1)
+        loss = criterion(log_probs.contiguous().view(-1, vocab_size), 
+                         labels.contiguous().view(-1))
         loss = loss / gradient_accumulation_steps
         loss.backward()
 
@@ -103,6 +127,7 @@ def test(epoch, data_loader, model, tokenizer, device):
     model.eval()
     loss_checker = LossChecker(num_losses=2)
     vocab_size = model.decoder.vocab_size
+    criterion = LabelSmoothing(vocab_size, tokenizer.pad_token_id, 0.1)
     t = tqdm(data_loader, desc='Test: ')
     with torch.no_grad():
         for step, batch in enumerate(t):
@@ -119,8 +144,8 @@ def test(epoch, data_loader, model, tokenizer, device):
             for i in range(batch_sz):
                 n_edges = geo_edge_index[0].shape[1]
                 offset_val = int(np.sqrt(n_edges)) * i
-                offset.append(torch.full(geo_edge_index[0].shape, offset_val))
-            offset = torch.stack(offset).cuda()
+                offset.append(torch.full(geo_edge_index[0].shape, offset_val, device=device))
+            offset = torch.stack(offset)
             geo_graph_batch_offset = geo_edge_index + offset
 
             new_dim = geo_graph_batch_offset.shape[0] * geo_graph_batch_offset.shape[2]
@@ -131,10 +156,12 @@ def test(epoch, data_loader, model, tokenizer, device):
             data_geo_graph_batch = Data(x=x_batch, edge_index=edge_index_batch, edge_attr=edge_attr_batch)
         
             output = model(data_geo_graph_batch, visual_mask,
-                       semantic_feature, semantic_mask,
-                       caption=input_ids, caption_mask=input_mask, labels=labels)
-
-            loss = output.loss
+                        semantic_feature, semantic_mask,
+                        caption=input_ids, caption_mask=input_mask)
+    
+            log_probs = F.log_softmax(output.logits, dim=-1)
+            loss = criterion(log_probs.contiguous().view(-1, vocab_size), 
+                             labels.contiguous().view(-1))
             loss_checker.update(loss.item(), 0.0)
             t.set_description("[Epoch #{0}] loss: {1:.3f}, {2:.3f}".format(epoch, *loss_checker.mean(last=10)))
     total_loss,_ = loss_checker.mean()
