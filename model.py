@@ -89,8 +89,7 @@ class Encoder(nn.Module):
         
         self.visual = VisualModel(self.visual_config)
         self.visual_normalize_video = NormalizeVideo(self.visual_config.vocab_size)
-        self.visual_lp2 = nn.Linear(self.visual_config.hidden_size, self.task_config.d_model)
-
+    
         # ====> Semantic <====
         self.semantic_embeddings = nn.Sequential(
             LayerNorm(self.task_config.semantic_dim),
@@ -101,8 +100,7 @@ class Encoder(nn.Module):
             EncoderLayer(self.visual_config.hidden_size, self.visual_config.num_attention_heads)
             for _ in range(self.task_config.visual_num_hidden_layers)
         ])
-        self.semantic_lp = nn.Linear(self.visual_config.hidden_size, self.task_config.d_model)
-
+        
         self.apply(self.init_weights)
 
     def init_weights(self, module):
@@ -127,20 +125,17 @@ class Encoder(nn.Module):
         fo_convolved = fo_convolved.unflatten(0, (batch, n_nodes))
 
         if shaped is False:
-            video_mask = video_mask.view(-1, video_mask.shape[-1])
             video = self.visual_normalize_video(fo_convolved)
 
         visual_layers, _ = self.visual(video, video_mask, output_all_encoded_layers=True)
         visual_output = visual_layers[-1]
-        visual_output = self.visual_lp2(visual_output)
 
         # ====> Semantic <====
         kg_output = self.semantic_embeddings(kg)
         for i in range(self.task_config.visual_num_hidden_layers):
             kg_output = self.semantic[i](kg_output, kg_mask)
-        kg_output = self.semantic_lp(kg_output)
 
-        return visual_output  + kg_output
+        return visual_output, kg_output
         
 class Decoder(nn.Module):
     def __init__(self, tokenizer, task_config, model_class):
@@ -162,7 +157,7 @@ class Decoder(nn.Module):
         for p in self.model.language_model.parameters():
             p.requires_grad = True
 
-        self.model.language_model.decoder.block = self.model.language_model.decoder.block[:3]
+        self.model.language_model.decoder.block = self.model.language_model.decoder.block[:self.task_config.visual_num_hidden_layers]
         self.vocab_size = self.model.language_model.config.vocab_size
         
         # ===> ÁP DỤNG LoRA <===
@@ -170,28 +165,35 @@ class Decoder(nn.Module):
             r=8,
             lora_alpha=16,
             target_modules=["q", "k", "v", "o"],  # attention projections trong T5
-            lora_dropout=0.05,
+            lora_dropout=0.01,
             bias="none",
             task_type="SEQ_2_SEQ_LM",
         )
         self.model.language_model = get_peft_model(self.model.language_model, lora_config)
         
-    def forward(self, encoder_hidden_states, caption, caption_mask=None):
+    def forward(self, encoder_hidden_states, video_mask, caption, caption_mask, labels):
         encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden_states)
         outputs = self.model.language_model(
-                encoder_outputs=encoder_outputs,
-                decoder_input_ids=caption,           
-                attention_mask=caption_mask,
-                return_dict=True,
+            encoder_outputs=encoder_outputs,
+            attention_mask=video_mask,            # mask cho encoder
+            decoder_input_ids=caption,            # input captions (shifted)
+            decoder_attention_mask=caption_mask,  # mask cho decoder
+            labels=labels,                        # ground truth captions (shifted by 1)
+            return_dict=True,
         )
         return outputs
-    def generate(self, encoder_hidden_states):
+    
+    def generate(self, encoder_hidden_states, video_mask):
         encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden_states)
         generated = self.model.language_model.generate(
             encoder_outputs=encoder_outputs,
+            attention_mask=video_mask,
+            decoder_start_token_id=self.tokenizer.eos_token_id,
             max_length=self.task_config.max_seq_len + 1,
             num_beams=5,
             early_stopping=True,
+            no_repeat_ngram_size=2,
+            length_penalty=1.0,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
@@ -203,11 +205,21 @@ class VCModel(nn.Module):
         self.task_config = task_config
         self.encoder = Encoder(task_config)
         self.decoder = Decoder(tokenizer, task_config, decoder_model_class)
-    def forward(self, geo_graph, video_mask, kg, kg_mask, caption=None, caption_mask=None):
-        encoder_hidden_states = self.encoder(geo_graph, video_mask, kg, kg_mask)
-        decoder_output = self.decoder(encoder_hidden_states, caption, caption_mask)
+        self.visual_lp = nn.Linear(self.task_config.hidden_size, self.decoder.model.language_model.config.d_model)
+        self.semantic_lp = nn.Linear(self.task_config.hidden_size, self.decoder.model.language_model.config.d_model)
+
+    def forward(self, geo_graph, video_mask, kg, kg_mask, caption, caption_mask, labels):
+        visual_output, kg_output = self.encoder(geo_graph, video_mask, kg, kg_mask)
+        visual_output = self.visual_lp(visual_output)
+        kg_output = self.semantic_lp(kg_output)
+        encoder_hidden_states = visual_output + kg_output
+        decoder_output = self.decoder(encoder_hidden_states, video_mask, caption, caption_mask, labels)
         return decoder_output
+    
     def generate(self, geo_graph, video_mask, kg, kg_mask):
-        encoder_hidden_states = self.encoder(geo_graph, video_mask, kg, kg_mask)
-        generated = self.decoder.generate(encoder_hidden_states)
+        visual_output, kg_output = self.encoder(geo_graph, video_mask, kg, kg_mask)
+        visual_output = self.visual_lp(visual_output)
+        kg_output = self.semantic_lp(kg_output)
+        encoder_hidden_states = visual_output + kg_output
+        generated = self.decoder.generate(encoder_hidden_states, video_mask)
         return generated
